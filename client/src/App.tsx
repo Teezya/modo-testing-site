@@ -4,6 +4,7 @@ import { ArrowRight, Check, ChevronLeft, GraduationCap, LockKeyhole, LogOut } fr
 const API = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 type Question = { text: string; options: string[] };
 type Result = { score: number; total: number; correct: number; incorrect: number };
+type ClassRow = { key:string; region:string; district:string; locality:string; schoolType:string; schoolName:string; grade:string; studentCount:number };
 type StudentRow = { id:string; fullName:string; region:string; district:string; locality:string; schoolType:string; schoolName:string; grade:string; score:number|null; total:number; status:string; createdAt:string; completedAt:string|null };
 const letters = ['А','Б','В','Г','Д'];
 
@@ -103,18 +104,27 @@ function Shell({children}:{children:React.ReactNode}) {return <main className="p
 function Admin() {
   const [token,setToken]=useState(sessionStorage.getItem('modo_admin_token')||'');
   const [login,setLogin]=useState(''); const [password,setPassword]=useState('');
-  const [rows,setRows]=useState<StudentRow[]>([]); const [error,setError]=useState(''); const [loading,setLoading]=useState(false);
+  const [rows,setRows]=useState<StudentRow[]>([]); const [classes,setClasses]=useState<ClassRow[]>([]); const [selectedClass,setSelectedClass]=useState(''); const [reportBusy,setReportBusy]=useState(false); const [notice,setNotice]=useState(''); const [error,setError]=useState(''); const [loading,setLoading]=useState(false);
   async function load(t:string) {
     setLoading(true);setError('');
     try {const r=await fetch(`${API}/api/admin/students`,{headers:{Authorization:`Bearer ${t}`}});const d=await r.json();if(!r.ok)throw Error(d.message);setRows(d);}
     catch(e:any){setError(e.message);sessionStorage.removeItem('modo_admin_token');setToken('');}
     finally{setLoading(false);}
   }
-  useEffect(()=>{if(token)load(token);},[token]);
+  useEffect(()=>{if(token){load(token);fetch(`${API}/api/admin/classes`,{headers:{Authorization:`Bearer ${token}`}}).then(r=>r.json()).then(d=>{setClasses(Array.isArray(d)?d:[]);if(Array.isArray(d)&&d.length)setSelectedClass(d[0].key);}).catch(()=>{});}},[token]);
   async function signIn(e:React.FormEvent){e.preventDefault();setLoading(true);setError('');try{const r=await fetch(`${API}/api/admin/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login,password})});const d=await r.json();if(!r.ok)throw Error(d.message);sessionStorage.setItem('modo_admin_token',d.token);setToken(d.token);}catch(e:any){setError(e.message);}finally{setLoading(false);}}
+  async function classReport(action:'download'|'email') {
+    if(!selectedClass)return;setReportBusy(true);setError('');setNotice('');
+    try { const r=await fetch(`${API}/api/admin/class-report`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${token}`},body:JSON.stringify({key:selectedClass,action})});
+      if(!r.ok){const d=await r.json();throw Error(d.message||'Ошибка формирования отчёта');}
+      if(action==='email'){const d=await r.json();setNotice(d.message);}
+      else {const blob=await r.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='MODO_Отчёт_класса.docx';a.click();URL.revokeObjectURL(url);setNotice('Word-отчёт сформирован и скачан.');}
+    } catch(e:any){setError(e.message||'Не удалось выполнить действие');} finally{setReportBusy(false);}
+  }
   if(!token) return <Shell><div className="login-card"><div className="brand"><span className="brand-icon"><LockKeyhole size={21}/></span><span>Администрирование</span></div><h1>Вход в панель</h1><form onSubmit={signIn} className="form-grid one"><label>Логин<input value={login} onChange={e=>setLogin(e.target.value)} required/></label><label>Пароль<input type="password" value={password} onChange={e=>setPassword(e.target.value)} required/></label>{error&&<div className="error">{error}</div>}<button className="primary" disabled={loading}>{loading?'Вход…':'Войти'}</button></form></div></Shell>;
   return <main className="admin-page"><header className="admin-header"><div className="brand"><span className="brand-icon"><GraduationCap size={22}/></span><span>МОДО <small>Админ-панель</small></span></div><button className="ghost" onClick={()=>{sessionStorage.removeItem('modo_admin_token');setToken('');}}><LogOut size={16}/> Выйти</button></header>
     <div className="admin-content"><div className="admin-title"><div><div className="eyebrow">РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ</div><h1>Ученики</h1></div><button className="ghost" onClick={()=>load(token)}>Обновить</button></div>
+      <section className="table-card" style={{padding:20,marginBottom:20}}><div className="table-heading"><h2>Отчёт по классу</h2><span>Один общий Word-документ</span></div><p className="muted">Выберите школу и класс. В документ попадут общая статистика и подробные ответы каждого ученика, завершившего тест.</p><label style={{display:'block',margin:'14px 0'}}>Класс<select value={selectedClass} onChange={e=>setSelectedClass(e.target.value)} style={{width:'100%',padding:12,marginTop:6}}><option value="">Выберите класс</option>{classes.map(c=><option key={c.key} value={c.key}>{c.schoolName} · {c.grade} · {c.locality} ({c.studentCount} уч.)</option>)}</select></label><div style={{display:'flex',gap:10,flexWrap:'wrap'}}><button className="primary" disabled={!selectedClass||reportBusy} onClick={()=>classReport('download')}>{reportBusy?'Формирование…':'Скачать Word-отчёт'}</button><button className="ghost" disabled={!selectedClass||reportBusy} onClick={()=>classReport('email')}>Отправить учителю на email</button></div>{notice&&<div className="success-message" style={{marginTop:12}}>{notice}</div>}{error&&<div className="error" style={{marginTop:12}}>{error}</div>}</section>
       <div className="stat-grid"><div className="stat-card"><span>Всего участников</span><b>{rows.length}</b></div><div className="stat-card"><span>Завершили тест</span><b>{rows.filter(r=>r.status==='Завершён').length}</b></div><div className="stat-card"><span>Средний балл</span><b>{rows.filter(r=>r.score!==null).length ? (rows.filter(r=>r.score!==null).reduce((s,r)=>s+(r.score||0),0)/rows.filter(r=>r.score!==null).length).toFixed(1) : '—'}</b></div></div>
       {error&&<div className="error">{error}</div>}
       <div className="table-card"><div className="table-heading"><h2>Список учеников</h2><span>{loading?'Загрузка…':`${rows.length} записей`}</span></div>
