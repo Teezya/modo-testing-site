@@ -7,6 +7,7 @@ type Result = { score: number; total: number; correct: number; incorrect: number
 type ClassRow = { key:string; region:string; district:string; locality:string; schoolType:string; schoolName:string; grade:string; studentCount:number };
 type StudentRow = { id:string; fullName:string; region:string; district:string; locality:string; schoolType:string; schoolName:string; grade:string; score:number|null; total:number; status:string; createdAt:string; completedAt:string|null };
 const letters = ['А','Б','В','Г','Д'];
+const gradeOptions = Array.from({ length: 11 }, (_, i) => String(i + 1)).flatMap(grade => [grade, ...['А','Б','В','Г','Д'].map(letter => `${grade}${letter}`)]);
 
 function App() {
   const [path, setPath] = useState(location.pathname);
@@ -71,7 +72,7 @@ function StudentApp() {
       <label>Село или город<input name="locality" placeholder="Название населённого пункта" required/></label>
       <label>Тип учебного заведения<select name="schoolType" required defaultValue=""><option value="" disabled>Выберите</option><option>Школа</option><option>Лицей</option><option>Гимназия</option><option>Другое</option></select></label>
       <label className="wide">Название школы<input name="schoolName" placeholder="Полное название школы" required/></label>
-      <label>Класс<input name="grade" placeholder="Например, 9А" required/></label>
+      <label>Класс<select name="grade" required defaultValue=""><option value="" disabled>Выберите класс</option>{gradeOptions.map(grade => <option key={grade} value={grade}>{grade}</option>)}</select></label>
       <label>ФИО<input name="fullName" placeholder="Фамилия Имя Отчество" required/></label>
       {error&&<div className="error wide">{error}</div>}
       <button className="primary wide" disabled={busy}>{busy?'Сохранение…':'Начать тест'} <ArrowRight size={18}/></button>
@@ -105,6 +106,12 @@ function Admin() {
   const [token,setToken]=useState(sessionStorage.getItem('modo_admin_token')||'');
   const [login,setLogin]=useState(''); const [password,setPassword]=useState('');
   const [rows,setRows]=useState<StudentRow[]>([]); const [classes,setClasses]=useState<ClassRow[]>([]); const [selectedClass,setSelectedClass]=useState(''); const [reportBusy,setReportBusy]=useState(false); const [notice,setNotice]=useState(''); const [error,setError]=useState(''); const [loading,setLoading]=useState(false);
+  const [search,setSearch]=useState(''); const [filterRegion,setFilterRegion]=useState(''); const [filterSchool,setFilterSchool]=useState(''); const [filterGrade,setFilterGrade]=useState(''); const [filterStatus,setFilterStatus]=useState('');
+  const regions=[...new Set(rows.map(r=>r.region).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ru'));
+  const schools=[...new Set(rows.filter(r=>!filterRegion||r.region===filterRegion).map(r=>r.schoolName).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ru'));
+  const grades=[...new Set(rows.filter(r=>(!filterRegion||r.region===filterRegion)&&(!filterSchool||r.schoolName===filterSchool)).map(r=>r.grade).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ru'));
+  const filteredRows=rows.filter(r=>{const q=search.trim().toLocaleLowerCase('ru');return (!q||[r.fullName,r.region,r.district,r.locality,r.schoolName,r.grade].join(' ').toLocaleLowerCase('ru').includes(q))&&(!filterRegion||r.region===filterRegion)&&(!filterSchool||r.schoolName===filterSchool)&&(!filterGrade||r.grade===filterGrade)&&(!filterStatus||r.status===filterStatus);});
+  function resetFilters(){setSearch('');setFilterRegion('');setFilterSchool('');setFilterGrade('');setFilterStatus('');}
   async function load(t:string) {
     setLoading(true);setError('');
     try {const r=await fetch(`${API}/api/admin/students`,{headers:{Authorization:`Bearer ${t}`}});const d=await r.json();if(!r.ok)throw Error(d.message);setRows(d);}
@@ -127,10 +134,18 @@ function Admin() {
       <section className="table-card" style={{padding:20,marginBottom:20}}><div className="table-heading"><h2>Отчёт по классу</h2><span>Один общий Word-документ</span></div><p className="muted">Выберите школу и класс. В документ попадут общая статистика и подробные ответы каждого ученика, завершившего тест.</p><label style={{display:'block',margin:'14px 0'}}>Класс<select value={selectedClass} onChange={e=>setSelectedClass(e.target.value)} style={{width:'100%',padding:12,marginTop:6}}><option value="">Выберите класс</option>{classes.map(c=><option key={c.key} value={c.key}>{c.schoolName} · {c.grade} · {c.locality} ({c.studentCount} уч.)</option>)}</select></label><div style={{display:'flex',gap:10,flexWrap:'wrap'}}><button className="primary" disabled={!selectedClass||reportBusy} onClick={()=>classReport('download')}>{reportBusy?'Формирование…':'Скачать Word-отчёт'}</button><button className="ghost" disabled={!selectedClass||reportBusy} onClick={()=>classReport('email')}>Отправить учителю на email</button></div>{notice&&<div className="success-message" style={{marginTop:12}}>{notice}</div>}{error&&<div className="error" style={{marginTop:12}}>{error}</div>}</section>
       <div className="stat-grid"><div className="stat-card"><span>Всего участников</span><b>{rows.length}</b></div><div className="stat-card"><span>Завершили тест</span><b>{rows.filter(r=>r.status==='Завершён').length}</b></div><div className="stat-card"><span>Средний балл</span><b>{rows.filter(r=>r.score!==null).length ? (rows.filter(r=>r.score!==null).reduce((s,r)=>s+(r.score||0),0)/rows.filter(r=>r.score!==null).length).toFixed(1) : '—'}</b></div></div>
       {error&&<div className="error">{error}</div>}
-      <div className="table-card"><div className="table-heading"><h2>Список учеников</h2><span>{loading?'Загрузка…':`${rows.length} записей`}</span></div>
+      <div className="table-card"><div className="table-heading"><h2>Список учеников</h2><span>{loading?'Загрузка…':`${filteredRows.length} из ${rows.length}`}</span></div>
+        <div className="admin-filters">
+          <input aria-label="Поиск" placeholder="Поиск по ФИО, школе, населённому пункту…" value={search} onChange={e=>setSearch(e.target.value)}/>
+          <select aria-label="Область" value={filterRegion} onChange={e=>{setFilterRegion(e.target.value);setFilterSchool('');setFilterGrade('');}}><option value="">Все области</option>{regions.map(v=><option key={v}>{v}</option>)}</select>
+          <select aria-label="Школа" value={filterSchool} onChange={e=>{setFilterSchool(e.target.value);setFilterGrade('');}}><option value="">Все школы</option>{schools.map(v=><option key={v}>{v}</option>)}</select>
+          <select aria-label="Класс" value={filterGrade} onChange={e=>setFilterGrade(e.target.value)}><option value="">Все классы</option>{grades.map(v=><option key={v}>{v}</option>)}</select>
+          <select aria-label="Статус" value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}><option value="">Все статусы</option><option value="Завершён">Завершили</option><option value="В процессе">В процессе</option></select>
+          <button className="ghost" onClick={resetFilters}>Сбросить</button>
+        </div>
         <div className="table-scroll"><table><thead><tr><th>ФИО</th><th>Область / район</th><th>Село / город</th><th>Школа</th><th>Класс</th><th>Баллы</th><th>Статус</th></tr></thead><tbody>
-        {rows.map(r=><tr key={r.id}><td className="name-cell">{r.fullName}</td><td>{r.region}, {r.district}</td><td>{r.locality}</td><td>{r.schoolType}: {r.schoolName}</td><td>{r.grade}</td><td><b>{r.score===null?'—':`${r.score} / ${r.total}`}</b></td><td><span className={`status ${r.status==='Завершён'?'done':''}`}>{r.status}</span></td></tr>)}
-        {!rows.length&&!loading&&<tr><td colSpan={7} className="empty">Пока нет зарегистрированных учеников</td></tr>}
+        {filteredRows.map(r=><tr key={r.id}><td className="name-cell">{r.fullName}</td><td>{r.region}, {r.district}</td><td>{r.locality}</td><td>{r.schoolType}: {r.schoolName}</td><td>{r.grade}</td><td><b>{r.score===null?'—':`${r.score} / ${r.total}`}</b></td><td><span className={`status ${r.status==='Завершён'?'done':''}`}>{r.status}</span></td></tr>)}
+        {!filteredRows.length&&!loading&&<tr><td colSpan={7} className="empty">{rows.length?'Ничего не найдено. Измените фильтры.':'Пока нет зарегистрированных учеников'}</td></tr>}
         </tbody></table></div>
       </div>
     </div>

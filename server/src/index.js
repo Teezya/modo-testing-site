@@ -1,8 +1,15 @@
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import dns from 'node:dns';
 
 dns.setServers(['8.8.8.8', '8.8.4.4']);
+
+// Поддерживаем .env как в корне проекта, так и в server/.env.
+const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+dotenv.config({ path: path.join(serverDir, '.env') });
+dotenv.config({ path: path.resolve(serverDir, '..', '.env'), override: false });
 
 import express from 'express';
 import cors from 'cors';
@@ -26,14 +33,26 @@ import { questions, publicTest } from './testData.js';
 
 const app = express();
 
+const allowedOrigins = new Set([
+  ...String(process.env.CLIENT_ORIGIN || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean),
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
+]);
+
 app.use(cors({
-  origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173'
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error('Origin is not allowed by CORS'));
+  }
 }));
 
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 5000;
-const SECRET = process.env.JWT_SECRET || 'development-secret-change-me';
+const SECRET = process.env.JWT_SECRET;
 
 function makeToken(payload) {
   return jwt.sign(payload, SECRET, {
@@ -85,6 +104,13 @@ app.post('/api/students/register', async (req, res) => {
           message: 'Заполните все поля.'
         });
       }
+    }
+
+    const grade = String(req.body.grade).trim();
+    if (!/^(?:[1-9]|1[01])(?:[АБВГД])?$/u.test(grade)) {
+      return res.status(400).json({
+        message: 'Выберите корректный класс от 1 до 11.'
+      });
     }
 
     const student = await Student.create(
@@ -239,12 +265,20 @@ app.post('/api/admin/login', (req, res) => {
 app.get('/api/admin/students', auth('admin'), async (_req, res) => {
   const attempts = await Attempt.find()
     .populate('student')
-    .sort({ createdAt: -1 })
+    .sort({ completed: -1, completedAt: -1, createdAt: -1 })
     .lean();
 
+  // Для каждого ученика показываем последнюю завершённую попытку.
+  // Если завершённых попыток нет — последнюю незавершённую.
+  const latestByStudent = new Map();
+  for (const attempt of attempts) {
+    if (!attempt.student) continue;
+    const studentId = String(attempt.student._id);
+    if (!latestByStudent.has(studentId)) latestByStudent.set(studentId, attempt);
+  }
+
   res.json(
-    attempts
-      .filter(a => a.student)
+    [...latestByStudent.values()]
       .map(a => ({
         id: String(a._id),
         fullName: a.student.fullName,
@@ -430,35 +464,41 @@ app.post('/api/admin/class-report', auth('admin'), async (req, res) => {
 
     const studentIds = students.map(s => s._id);
 
-    const attempts = await Attempt.find({
+    const allCompletedAttempts = await Attempt.find({
       student: { $in: studentIds },
       completed: true
     })
       .populate('student')
-      .sort({ score: -1, completedAt: 1 })
+      .sort({ completedAt: -1, createdAt: -1 })
       .lean();
 
-    if (!attempts.length) {
-      return res.status(400).json({
-        message: 'В выбранном классе ещё нет завершённых тестирований.'
-      });
+    // В отчёт включаем только последнюю завершённую попытку каждого ученика.
+    const latestCompletedByStudent = new Map();
+    for (const attempt of allCompletedAttempts) {
+      if (!attempt.student) continue;
+      const studentId = String(attempt.student._id);
+      if (!latestCompletedByStudent.has(studentId)) {
+        latestCompletedByStudent.set(studentId, attempt);
+      }
     }
+    const attempts = [...latestCompletedByStudent.values()]
+      .sort((a, b) => (b.score || 0) - (a.score || 0));
 
     const totalQuestions = questions.length;
     const scores = attempts.map(a => a.score);
 
-    const average =
-      scores.reduce((a, b) => a + b, 0) / scores.length;
+    const average = scores.length
+      ? scores.reduce((a, b) => a + b, 0) / scores.length
+      : 0;
 
     const sortedScores = [...scores].sort((a, b) => a - b);
 
-    const median =
-      sortedScores.length % 2
-        ? sortedScores[Math.floor(sortedScores.length / 2)]
-        : (
-            sortedScores[sortedScores.length / 2 - 1] +
-            sortedScores[sortedScores.length / 2]
-          ) / 2;
+    const median = !sortedScores.length ? 0 : sortedScores.length % 2
+      ? sortedScores[Math.floor(sortedScores.length / 2)]
+      : (
+          sortedScores[sortedScores.length / 2 - 1] +
+          sortedScores[sortedScores.length / 2]
+        ) / 2;
 
     const questionStats = questions.map((q, i) => {
       const answered = attempts
@@ -513,8 +553,8 @@ app.post('/api/admin/class-report', auth('admin'), async (req, res) => {
           ['Не завершили тестирование', students.length - attempts.length],
           ['Средний балл', `${average.toFixed(2)} из ${totalQuestions}`],
           ['Средний результат', `${(average / totalQuestions * 100).toFixed(1)}%`],
-          ['Максимальный результат', `${Math.max(...scores)} из ${totalQuestions}`],
-          ['Минимальный результат', `${Math.min(...scores)} из ${totalQuestions}`],
+          ['Максимальный результат', `${scores.length ? Math.max(...scores) : 0} из ${totalQuestions}`],
+          ['Минимальный результат', `${scores.length ? Math.min(...scores) : 0} из ${totalQuestions}`],
           ['Медианный результат', `${median} из ${totalQuestions}`]
         ]
       ),
@@ -746,11 +786,12 @@ app.post('/api/admin/class-report', auth('admin'), async (req, res) => {
 });
 
 // Проверка MongoDB
-if (!process.env.MONGODB_URI) {
-  console.error(
-    'MONGODB_URI is missing. Add your MongoDB Atlas connection string to server/.env'
-  );
+const requiredEnv = ['MONGODB_URI', 'JWT_SECRET', 'ADMIN_LOGIN', 'ADMIN_PASSWORD'];
+const missingEnv = requiredEnv.filter(name => !process.env[name]);
 
+if (missingEnv.length) {
+  console.error(`Missing required environment variables: ${missingEnv.join(', ')}`);
+  console.error('Place your existing .env in the project root or in server/.env.');
   process.exit(1);
 }
 
