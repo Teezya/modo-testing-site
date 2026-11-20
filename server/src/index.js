@@ -28,8 +28,8 @@ import {
   AlignmentType
 } from 'docx';
 
-import { Student, Attempt } from './models.js';
-import { questions, publicTest } from './testData.js';
+import { Student, Attempt, Topic, Assignment, Submission } from './models.js';
+import { questions, publicTest, passage } from './testData.js';
 
 const app = express();
 
@@ -113,16 +113,15 @@ app.post('/api/students/register', async (req, res) => {
       });
     }
 
-    const student = await Student.create(
-      Object.fromEntries(
-        fields.map(k => [k, String(req.body[k]).trim()])
-      )
-    );
-
-    const attempt = await Attempt.create({
-      student: student._id,
-      total: questions.length
-    });
+    // Reuse an existing profile when the same full registration details are submitted.
+    const profile = Object.fromEntries(fields.map(k => [k, String(req.body[k]).trim()]));
+    const norm = value => String(value || '').trim().toLocaleLowerCase('ru-RU').replace(/\s+/g, ' ');
+    const candidates = await Student.find({ fullName: profile.fullName }).sort({ createdAt: 1 });
+    let student = candidates.find(candidate => fields.every(k => norm(candidate[k]) === norm(profile[k])));
+    const returning = Boolean(student);
+    if (!student) student = await Student.create(profile);
+    let attempt = await Attempt.findOne({ student: student._id, completed: false }).sort({ createdAt: -1 });
+    if (!attempt) attempt = await Attempt.create({ student: student._id, total: questions.length });
 
     const token = makeToken({
       role: 'student',
@@ -130,10 +129,11 @@ app.post('/api/students/register', async (req, res) => {
       attemptId: String(attempt._id)
     });
 
-    res.status(201).json({
+    res.status(returning ? 200 : 201).json({
       token,
       student: { fullName: student.fullName },
-      attempt: { id: String(attempt._id) }
+      attempt: { id: String(attempt._id) },
+      returning
     });
   } catch (e) {
     console.error('Student registration error:', e);
@@ -785,6 +785,237 @@ app.post('/api/admin/class-report', auth('admin'), async (req, res) => {
   }
 });
 
+// ===== МНОГОТЕМНАЯ УЧЕБНАЯ ПЛАТФОРМА =====
+// Создаём тему старого теста один раз, не затрагивая существующие попытки.
+app.get('/api/learning/topics', auth('student'), async (req, res) => {
+  try {
+    const topics = await Topic.find({ published: true }).sort({ createdAt: 1 }).lean();
+    const assignments = await Assignment.find({ published: true }).lean();
+    const submissions = await Submission.find({ student: req.user.studentId }).lean();
+    const data = topics.map(topic => {
+      const tasks = assignments.filter(a => String(a.topic) === String(topic._id));
+      const done = tasks.filter(a => submissions.some(s => String(s.assignment) === String(a._id) && s.status === 'graded'));
+      const scored = done.filter(a => submissions.find(s => String(s.assignment) === String(a._id))?.score !== null);
+      const earned = scored.reduce((sum, a) => sum + (submissions.find(s => String(s.assignment) === String(a._id))?.score || 0), 0);
+      const possible = scored.reduce((sum, a) => sum + (a.maxScore || 100), 0);
+      return { id: String(topic._id), title: topic.title, description: topic.description, legacyModo: topic.legacyModo,
+        total: tasks.length, completed: done.length, percent: tasks.length ? Math.round(done.length / tasks.length * 100) : 0,
+        score: possible ? Math.round(earned / possible * 100) : null, assignments: tasks.map(a => ({ id: String(a._id), title: a.title, type: a.type, maxScore: a.maxScore,
+          status: submissions.find(s => String(s.assignment) === String(a._id))?.status || 'not_started', score: submissions.find(s => String(s.assignment) === String(a._id))?.score ?? null })) };
+    });
+    res.json(data);
+  } catch (e) { console.error(e); res.status(500).json({ message: 'Не удалось загрузить темы.' }); }
+});
+
+app.get('/api/learning/assignments/:id', auth('student'), async (req, res) => {
+  try {
+    const a = await Assignment.findOne({ _id: req.params.id, published: true }).lean();
+    if (!a) return res.status(404).json({ message: 'Задание не найдено.' });
+    const previous = await Submission.findOne({ assignment: a._id, student: req.user.studentId }).lean();
+    // Явно возвращаем текст чтения: он хранится отдельно от краткого описания задания.
+    const passage = [a.passage, a.readingText, a.sourceText, a.materialText]
+      .find(value => typeof value === 'string' && value.trim()) || '';
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      ...a,
+      id: String(a._id),
+      topicId: String(a.topic),
+      passage,
+      description: a.description || a.instructions || '',
+      questions: Array.isArray(a.questions) ? a.questions : [],
+      previous: previous ? { text: previous.text, status: previous.status, score: previous.score, comment: previous.comment } : null
+    });
+  } catch (e) {
+    console.error('Assignment load error:', e);
+    res.status(500).json({ message: 'Не удалось загрузить задание.' });
+  }
+});
+
+app.post('/api/learning/assignments/:id/submit', auth('student'), async (req, res) => {
+  try {
+    const a = await Assignment.findOne({ _id: req.params.id, published: true });
+    if (!a) return res.status(404).json({ message: 'Задание не найдено.' });
+    const fileData = String(req.body.fileData || '');
+    if (fileData.length > 8 * 1024 * 1024) return res.status(413).json({ message: 'Файл слишком большой. Максимальный размер — около 6 МБ.' });
+    let payload = { assignment: a._id, topic: a.topic, student: req.user.studentId, text: String(req.body.text || ''), fileName: String(req.body.fileName || '').slice(0, 255), fileData, status: 'submitted', score: null };
+    if (a.type === 'quiz') {
+      const answers = Array.isArray(req.body.answers) ? req.body.answers : [];
+      if (answers.length !== a.questions.length) return res.status(400).json({ message: 'Ответьте на все вопросы.' });
+      payload.answers = answers.map((answerIndex, questionIndex) => ({ questionIndex, answerIndex, isCorrect: Number(answerIndex) === Number(a.questions[questionIndex].correctIndex) }));
+      payload.score = payload.answers.filter(x => x.isCorrect).length;
+      payload.status = 'graded';
+      payload.gradedAt = new Date();
+    } else if (a.type === 'text' && !payload.text.trim()) return res.status(400).json({ message: 'Введите ответ.' });
+    else if (a.type === 'file' && !payload.fileData) return res.status(400).json({ message: 'Прикрепите файл.' });
+    const saved = await Submission.findOneAndUpdate({ assignment: a._id, student: req.user.studentId }, payload, { upsert: true, new: true, setDefaultsOnInsert: true });
+    res.json({ message: a.type === 'quiz' ? 'Тест проверен автоматически.' : 'Ответ отправлен на проверку.', status: saved.status, score: saved.score });
+  } catch (e) { console.error(e); res.status(500).json({ message: 'Не удалось отправить работу.' }); }
+});
+
+// Администратор: темы и задания
+app.get('/api/admin/topics', auth('admin'), async (_req, res) => {
+  const topics = await Topic.find().sort({ createdAt: -1 }).lean();
+  const assignments = await Assignment.find().lean();
+  res.json(topics.map(t => ({ ...t, id: String(t._id), assignments: assignments.filter(a => String(a.topic) === String(t._id)).map(a => ({ ...a, id: String(a._id) })) })));
+});
+app.post('/api/admin/topics', auth('admin'), async (req, res) => {
+  const title = String(req.body.title || '').trim();
+  if (!title) return res.status(400).json({ message: 'Укажите название темы.' });
+  const topic = await Topic.create({ title, description: String(req.body.description || ''), published: !!req.body.published });
+  res.status(201).json({ id: String(topic._id), title: topic.title });
+});
+app.patch('/api/admin/topics/:id', auth('admin'), async (req, res) => {
+  const update = {};
+  if (req.body.title !== undefined) update.title = String(req.body.title).trim();
+  if (req.body.description !== undefined) update.description = String(req.body.description);
+  if (req.body.published !== undefined) update.published = !!req.body.published;
+  const topic = await Topic.findByIdAndUpdate(req.params.id, update, { new: true });
+  if (!topic) return res.status(404).json({ message: 'Тема не найдена.' });
+  res.json({ id: String(topic._id), title: topic.title, published: topic.published });
+});
+app.delete('/api/admin/topics/:id', auth('admin'), async (req, res) => {
+  const topic = await Topic.findById(req.params.id);
+  if (!topic) return res.status(404).json({ message: 'Тема не найдена.' });
+  await Assignment.deleteMany({ topic: topic._id });
+  await Submission.deleteMany({ topic: topic._id });
+  await topic.deleteOne();
+  res.json({ ok: true });
+});
+app.post('/api/admin/topics/:id/assignments', auth('admin'), async (req, res) => {
+  const topic = await Topic.findById(req.params.id);
+  if (!topic) return res.status(404).json({ message: 'Тема не найдена.' });
+  const title = String(req.body.title || '').trim();
+  const type = ['quiz', 'text', 'file', 'material'].includes(req.body.type) ? req.body.type : 'text';
+  if (!title) return res.status(400).json({ message: 'Укажите название задания.' });
+  const questionsData = type === 'quiz' && Array.isArray(req.body.questions) ? req.body.questions.map(q => ({ text: String(q.text || ''), options: Array.isArray(q.options) ? q.options.map(String).slice(0, 6) : [], correctIndex: Number(q.correctIndex) })) : [];
+  if (type === 'quiz' && (!questionsData.length || questionsData.some(q => !q.text || q.options.length < 2 || q.correctIndex < 0 || q.correctIndex >= q.options.length))) return res.status(400).json({ message: 'Проверьте вопросы и правильные ответы.' });
+  const a = await Assignment.create({ topic: topic._id, title, description: String(req.body.description || ''), type, maxScore: Number(req.body.maxScore) || (type === 'quiz' ? questionsData.length : 100), questions: questionsData, materialUrl: String(req.body.materialUrl || ''), materialName: String(req.body.materialName || ''), published: req.body.published !== false });
+  res.status(201).json({ id: String(a._id), title: a.title });
+});
+app.patch('/api/admin/assignments/:id', auth('admin'), async (req, res) => {
+  const a = await Assignment.findByIdAndUpdate(req.params.id, { $set: { published: !!req.body.published } }, { new: true });
+  if (!a) return res.status(404).json({ message: 'Задание не найдено.' });
+  res.json({ id: String(a._id), published: a.published });
+});
+app.get('/api/admin/classes/:key/progress', auth('admin'), async (req, res) => {
+  try {
+    const parts = decodeURIComponent(req.params.key).split('|||');
+    if (parts.length !== 6) return res.status(400).json({ message: 'Некорректный класс.' });
+    const [region, district, locality, schoolType, schoolName, grade] = parts;
+    const students = await Student.find({ region, district, locality, schoolType, schoolName, grade }).lean();
+    const topics = await Topic.find().sort({ createdAt: 1 }).lean();
+    const assignments = await Assignment.find().lean();
+    const submissions = await Submission.find({ student: { $in: students.map(s => s._id) } }).sort({ submittedAt: -1 }).lean();
+    const oldAttempts = await Attempt.find({ student: { $in: students.map(s => s._id) } }).sort({ completedAt: -1, createdAt: -1 }).lean();
+    const topicRows = topics.map(t => ({ id: String(t._id), title: t.title }));
+    const studentRows = students.map(student => ({
+      id: String(student._id), fullName: student.fullName,
+      topics: topics.map(topic => {
+        const tasks = assignments.filter(a => String(a.topic) === String(topic._id) && a.type !== 'material');
+        const taskRows = tasks.map(task => {
+          const sub = submissions.find(x => String(x.student) === String(student._id) && String(x.assignment) === String(task._id));
+          const maxScore = Number(task.maxScore || 100);
+          const isDone = !!sub;
+          const isGraded = sub?.status === 'graded' && sub.score !== null;
+          return {
+            id: String(task._id), title: task.title, type: task.type,
+            status: !sub ? 'not_started' : isGraded ? 'graded' : 'submitted',
+            statusLabel: !sub ? 'Не начато' : isGraded ? 'Проверено' : 'На проверке',
+            done: isDone, score: sub?.score ?? null, maxScore,
+            percent: isGraded ? Math.round((Number(sub.score) / maxScore) * 100) : null,
+            submittedAt: sub?.submittedAt || null, gradedAt: sub?.gradedAt || null,
+            comment: sub?.comment || '', text: sub?.text || '', fileName: sub?.fileName || '',
+            answers: sub?.answers || []
+          };
+        });
+        const graded = taskRows.filter(x => x.status === 'graded');
+        const earned = graded.reduce((n, x) => n + Number(x.score || 0), 0);
+        const maximum = graded.reduce((n, x) => n + Number(x.maxScore || 0), 0);
+        const submitted = taskRows.filter(x => x.done).length;
+        const percent = maximum ? Math.round(earned / maximum * 100) : null;
+        const legacyAttempts = oldAttempts.filter(a => String(a.student) === String(student._id) && a.completed);
+        return {
+          id: String(topic._id), title: topic.title,
+          completed: submitted, graded: graded.length, total: tasks.length,
+          status: !tasks.length ? 'no_tasks' : submitted === 0 ? 'not_started' : submitted < tasks.length ? 'in_progress' : graded.length === tasks.length ? 'completed' : 'pending_review',
+          statusLabel: !tasks.length ? 'Нет заданий' : submitted === 0 ? 'Не начато' : submitted < tasks.length ? 'В процессе' : graded.length === tasks.length ? 'Все проверено' : 'Ожидает проверки',
+          score: percent, earned, maximum, assignments: taskRows,
+          legacyResult: topic.legacyModo && legacyAttempts.length ? { score: legacyAttempts[0].score, total: legacyAttempts[0].total, completedAt: legacyAttempts[0].completedAt } : null
+        };
+      })
+    }));
+    res.json({ class: { region, district, locality, schoolType, schoolName, grade }, topics: topicRows, students: studentRows });
+  } catch (e) {
+    console.error('Class progress error:', e);
+    res.status(500).json({ message: 'Не удалось загрузить успеваемость класса.' });
+  }
+});
+app.post('/api/admin/topics/:id/report', auth('admin'), async (req, res) => {
+  try {
+    const { action = 'download', classKey = '' } = req.body || {};
+    const topic = await Topic.findById(req.params.id).lean();
+    if (!topic) return res.status(404).json({ message: 'Тема не найдена.' });
+    let studentFilter = {};
+    if (classKey) {
+      const parts = String(classKey).split('|||');
+      if (parts.length !== 6) return res.status(400).json({ message: 'Некорректный класс.' });
+      const [region, district, locality, schoolType, schoolName, grade] = parts;
+      studentFilter = { region, district, locality, schoolType, schoolName, grade };
+    }
+    const students = await Student.find(studentFilter).sort({ fullName: 1 }).lean();
+    const assignments = await Assignment.find({ topic: topic._id, type: { $ne: 'material' } }).sort({ createdAt: 1 }).lean();
+    const submissions = await Submission.find({ topic: topic._id, student: { $in: students.map(s => s._id) } }).sort({ submittedAt: -1 }).lean();
+    const rows = students.map(student => {
+      const taskResults = assignments.map(task => {
+        const sub = submissions.find(x => String(x.student) === String(student._id) && String(x.assignment) === String(task._id));
+        const status = !sub ? 'Не начато' : sub.status === 'graded' && sub.score !== null ? 'Проверено' : 'На проверке';
+        return { title: task.title, status, score: sub?.score ?? null, max: task.maxScore || 100, percent: sub?.status === 'graded' && sub.score !== null ? Math.round(Number(sub.score) / Number(task.maxScore || 100) * 100) : null, submittedAt: sub?.submittedAt, comment: sub?.comment || '' };
+      });
+      const graded = taskResults.filter(x => x.percent !== null);
+      const max = graded.reduce((n, x) => n + x.max, 0);
+      const earned = graded.reduce((n, x) => n + Number(x.score || 0), 0);
+      return { student, taskResults, submitted: taskResults.filter(x => x.status !== 'Не начато').length, total: assignments.length, earned, max, percent: max ? Math.round(earned / max * 100) : null };
+    });
+    const doc = new Document({ sections: [{ children: [
+      new Paragraph({ text: `Отчёт по теме: ${topic.title}`, heading: HeadingLevel.HEADING_1 }),
+      new Paragraph({ text: `Дата формирования: ${new Date().toLocaleString('ru-RU')}` }),
+      ...(classKey ? [new Paragraph({ text: `Класс: ${students[0]?.schoolName || ''}, ${students[0]?.grade || ''}` })] : []),
+      new Paragraph({ text: `Учеников: ${students.length}. Заданий в теме: ${assignments.length}.` }),
+      makeTable(['Ученик', 'Выполнено', 'Оценка', 'Статус'], rows.map(r => [r.student.fullName, `${r.submitted}/${r.total}`, r.percent === null ? 'Нет оценки' : `${r.percent}% (${r.earned}/${r.max})`, r.submitted === 0 ? 'Не приступал' : r.submitted < r.total ? 'Не всё выполнено' : r.percent === null ? 'Ожидает проверки' : 'Завершено'])),
+      ...rows.flatMap(r => [new Paragraph({ text: r.student.fullName, heading: HeadingLevel.HEADING_2 }), makeTable(['Задание', 'Статус', 'Баллы', 'Процент', 'Комментарий'], r.taskResults.map(t => [t.title, t.status, t.score === null ? '—' : `${t.score}/${t.max}`, t.percent === null ? '—' : `${t.percent}%`, t.comment || '—']))])
+    ] }] });
+    const buffer = await Packer.toBuffer(doc);
+    const filename = `MODO_${topic.title.replace(/[^\p{L}\p{N}_-]+/gu, '_')}_report.docx`;
+    if (action === 'email') {
+      const reportRecipient = process.env.ADMIN_EMAIL || process.env.TEACHER_EMAIL;
+      if (!process.env.BREVO_API_KEY || !reportRecipient || !process.env.SMTP_FROM) return res.status(400).json({ message: 'Для отправки настройте BREVO_API_KEY, SMTP_FROM и ADMIN_EMAIL (или TEACHER_EMAIL) в .env.' });
+      const mail = await fetch('https://api.brevo.com/v3/smtp/email', { method: 'POST', headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ sender: { email: process.env.SMTP_FROM }, to: [{ email: reportRecipient }], subject: `Отчёт МОДО: ${topic.title}`, textContent: `Во вложении отчёт по теме «${topic.title}».`, attachment: [{ name: filename, content: buffer.toString('base64') }] }) });
+      if (!mail.ok) { const detail = await mail.text(); console.error('Brevo topic report error:', detail); return res.status(502).json({ message: 'Не удалось отправить письмо через Brevo.' }); }
+      return res.json({ message: `Отчёт по теме отправлен на ${reportRecipient}.` });
+    }
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.send(buffer);
+  } catch (e) {
+    console.error('Topic report error:', e);
+    res.status(500).json({ message: 'Не удалось сформировать отчёт по теме.' });
+  }
+});
+
+app.get('/api/admin/topics/:id/submissions', auth('admin'), async (req, res) => {
+  const rows = await Submission.find({ topic: req.params.id }).populate('student').populate('assignment').sort({ submittedAt: -1 }).lean();
+  res.json(rows.filter(x => x.student && x.assignment).map(x => ({ id: String(x._id), student: x.student.fullName, assignment: x.assignment.title, type: x.assignment.type, text: x.text, fileName: x.fileName, score: x.score, status: x.status, comment: x.comment })));
+});
+app.patch('/api/admin/submissions/:id/grade', auth('admin'), async (req, res) => {
+  const score = Number(req.body.score);
+  if (!Number.isFinite(score) || score < 0) return res.status(400).json({ message: 'Укажите корректный балл.' });
+  const sub = await Submission.findById(req.params.id).populate('assignment');
+  if (!sub) return res.status(404).json({ message: 'Работа не найдена.' });
+  if (score > (sub.assignment?.maxScore || 100)) return res.status(400).json({ message: 'Балл выше максимального.' });
+  sub.score = score; sub.comment = String(req.body.comment || ''); sub.status = 'graded'; sub.gradedAt = new Date(); await sub.save();
+  res.json({ ok: true, score: sub.score });
+});
+
 // Проверка MongoDB
 const requiredEnv = ['MONGODB_URI', 'JWT_SECRET', 'ADMIN_LOGIN', 'ADMIN_PASSWORD'];
 const missingEnv = requiredEnv.filter(name => !process.env[name]);
@@ -797,7 +1028,59 @@ if (missingEnv.length) {
 
 // Запуск сервера
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => {
+  .then(async () => {
+    // Первоначальная тема со старым тестом: создаётся один раз, не удаляет старые данные.
+    const legacy = await Topic.findOne({ legacyModo: true });
+    let legacyTopic = legacy;
+    if (!legacyTopic) {
+      legacyTopic = await Topic.create({ title: 'МОДО — Рынок труда и профессии будущего', description: 'Исходный тест МОДО и материалы по теме', published: true, legacyModo: true });
+    }
+    // У темы старого теста должна быть одна связанная карточка задания.
+    let legacyAssignment = await Assignment.findOne({ topic: legacyTopic._id, type: 'quiz', title: 'Исходный тест МОДО' });
+    if (!legacyAssignment) {
+      legacyAssignment = await Assignment.create({ topic: legacyTopic._id, title: 'Исходный тест МОДО', description: 'Тест «Рынок труда и профессии будущего» из первоначальной версии платформы.', passage, type: 'quiz', questions: questions.map(q => ({ text: q.text, options: q.options, correctIndex: q.correct })), maxScore: questions.length, published: true });
+    }
+
+    if (!legacyAssignment.passage) { legacyAssignment.passage = passage; await legacyAssignment.save(); }
+
+    // Идемпотентный импорт: для каждого ученика берём последнюю завершённую
+    // старую попытку. Исходные Attempts не изменяем и не удаляем.
+    const legacyAttempts = await Attempt.find({ completed: true }).sort({ completedAt: -1, createdAt: -1 }).lean();
+    const latestByStudent = new Map();
+    for (const attempt of legacyAttempts) {
+      const studentId = String(attempt.student);
+      if (!latestByStudent.has(studentId)) latestByStudent.set(studentId, attempt);
+    }
+    let importedLegacyCount = 0;
+    for (const attempt of latestByStudent.values()) {
+      const alreadyImported = await Submission.findOne({ legacyAttempt: attempt._id }).select('_id').lean();
+      if (alreadyImported) continue;
+      const originalTotal = Number(attempt.total || legacyAssignment.maxScore || questions.length);
+      const originalScore = Number(attempt.score || 0);
+      const targetMax = Number(legacyAssignment.maxScore || questions.length);
+      const normalizedScore = originalTotal > 0 ? Math.round((originalScore / originalTotal) * targetMax * 100) / 100 : 0;
+      await Submission.create({
+        assignment: legacyAssignment._id,
+        topic: legacyTopic._id,
+        student: attempt.student,
+        answers: Array.isArray(attempt.answers) ? attempt.answers.map((answer, index) => ({
+          questionIndex: Number(answer.questionIndex ?? index),
+          answerIndex: Number(answer.answerIndex ?? -1),
+          isCorrect: Boolean(answer.isCorrect)
+        })) : [],
+        score: Math.max(0, Math.min(targetMax, normalizedScore)),
+        status: 'graded',
+        submittedAt: attempt.completedAt || attempt.updatedAt || attempt.createdAt || new Date(),
+        gradedAt: attempt.completedAt || attempt.updatedAt || attempt.createdAt || new Date(),
+        legacyAttempt: attempt._id,
+        legacyOriginalScore: originalScore,
+        legacyOriginalTotal: originalTotal,
+        comment: 'Импортировано из истории старого теста МОДО.'
+      });
+      importedLegacyCount += 1;
+    }
+    console.log(`Legacy MODO history migration: ${importedLegacyCount} new result(s) imported; ${latestByStudent.size} latest completed attempt(s) found.`);
+
     app.listen(PORT, () => {
       console.log(
         `API connected to MongoDB Atlas. API: http://localhost:${PORT}`
