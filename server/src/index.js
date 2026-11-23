@@ -787,6 +787,17 @@ app.post('/api/admin/class-report', auth('admin'), async (req, res) => {
 
 // ===== МНОГОТЕМНАЯ УЧЕБНАЯ ПЛАТФОРМА =====
 // Создаём тему старого теста один раз, не затрагивая существующие попытки.
+app.get('/api/learning/standalone-assignments', auth('student'), async (req, res) => {
+  try {
+    const assignments = await Assignment.find({ topic: null, published: true, type: 'quiz' }).sort({ createdAt: -1 }).lean();
+    const submissions = await Submission.find({ student: req.user.studentId, assignment: { $in: assignments.map(a => a._id) } }).lean();
+    res.json(assignments.map(a => {
+      const sub = submissions.find(x => String(x.assignment) === String(a._id));
+      return { id: String(a._id), title: a.title, passage: a.passage || '', description: a.description || '', total: (a.questions || []).length, status: sub?.status || 'not_started', score: sub?.score ?? null };
+    }));
+  } catch (e) { console.error(e); res.status(500).json({ message: 'Не удалось загрузить задания.' }); }
+});
+
 app.get('/api/learning/topics', auth('student'), async (req, res) => {
   try {
     const topics = await Topic.find({ published: true }).sort({ createdAt: 1 }).lean();
@@ -819,10 +830,10 @@ app.get('/api/learning/assignments/:id', auth('student'), async (req, res) => {
     res.json({
       ...a,
       id: String(a._id),
-      topicId: String(a.topic),
+      topicId: a.topic ? String(a.topic) : null,
       passage,
       description: a.description || a.instructions || '',
-      questions: Array.isArray(a.questions) ? a.questions : [],
+      questions: Array.isArray(a.questions) ? a.questions.map(q => ({ text: q.text, options: q.options })) : [],
       previous: previous ? { text: previous.text, status: previous.status, score: previous.score, comment: previous.comment } : null
     });
   } catch (e) {
@@ -837,7 +848,7 @@ app.post('/api/learning/assignments/:id/submit', auth('student'), async (req, re
     if (!a) return res.status(404).json({ message: 'Задание не найдено.' });
     const fileData = String(req.body.fileData || '');
     if (fileData.length > 8 * 1024 * 1024) return res.status(413).json({ message: 'Файл слишком большой. Максимальный размер — около 6 МБ.' });
-    let payload = { assignment: a._id, topic: a.topic, student: req.user.studentId, text: String(req.body.text || ''), fileName: String(req.body.fileName || '').slice(0, 255), fileData, status: 'submitted', score: null };
+    let payload = { assignment: a._id, ...(a.topic ? { topic: a.topic } : {}), student: req.user.studentId, text: String(req.body.text || ''), fileName: String(req.body.fileName || '').slice(0, 255), fileData, status: 'submitted', score: null };
     if (a.type === 'quiz') {
       const answers = Array.isArray(req.body.answers) ? req.body.answers : [];
       if (answers.length !== a.questions.length) return res.status(400).json({ message: 'Ответьте на все вопросы.' });
@@ -853,6 +864,67 @@ app.post('/api/learning/assignments/:id/submit', auth('student'), async (req, re
 });
 
 // Администратор: темы и задания
+// Самостоятельные задания без обязательного создания тем.
+app.get('/api/admin/assignments', auth('admin'), async (_req, res) => {
+  const rows = await Assignment.find({ topic: null }).sort({ createdAt: -1 }).lean();
+  res.json(rows.map(a => ({ ...a, id: String(a._id) })));
+});
+app.post('/api/admin/assignments', auth('admin'), async (req, res) => {
+  try {
+    const title = String(req.body.title || '').trim();
+    const passageText = String(req.body.passage || '').trim();
+    const qs = Array.isArray(req.body.questions) ? req.body.questions.map(q => ({
+      text: String(q.text || '').trim(),
+      options: Array.isArray(q.options) ? q.options.map(x => String(x).trim()).slice(0, 5) : [],
+      correctIndex: Number(q.correctIndex)
+    })) : [];
+    if (!title || !passageText) return res.status(400).json({ message: 'Укажите название задания и текст для чтения.' });
+    if (!qs.length || qs.some(q => !q.text || q.options.length !== 5 || q.options.some(x => !x) || !Number.isInteger(q.correctIndex) || q.correctIndex < 0 || q.correctIndex > 4)) return res.status(400).json({ message: 'В каждом вопросе должно быть 5 заполненных вариантов и один правильный ответ.' });
+    const a = await Assignment.create({ topic: null, title, passage: passageText, description: String(req.body.description || ''), type: 'quiz', questions: qs, maxScore: qs.length, published: req.body.published === true });
+    res.status(201).json({ id: String(a._id), title: a.title, published: a.published });
+  } catch (e) { console.error('Standalone assignment create error:', e); res.status(500).json({ message: 'Не удалось создать задание.' }); }
+});
+app.put('/api/admin/assignments/:id', auth('admin'), async (req, res) => {
+  try {
+    const a = await Assignment.findOne({ _id: req.params.id, topic: null });
+    if (!a) return res.status(404).json({ message: 'Задание не найдено.' });
+    const title = String(req.body.title || '').trim();
+    const passageText = String(req.body.passage || '').trim();
+    const qs = Array.isArray(req.body.questions) ? req.body.questions.map(q => ({ text: String(q.text || '').trim(), options: Array.isArray(q.options) ? q.options.map(x => String(x).trim()).slice(0, 5) : [], correctIndex: Number(q.correctIndex) })) : [];
+    if (!title || !passageText || !qs.length || qs.some(q => !q.text || q.options.length !== 5 || q.options.some(x => !x) || !Number.isInteger(q.correctIndex) || q.correctIndex < 0 || q.correctIndex > 4)) return res.status(400).json({ message: 'Проверьте название, текст и все вопросы с пятью вариантами.' });
+    a.title = title; a.passage = passageText; a.description = String(req.body.description || ''); a.questions = qs; a.maxScore = qs.length;
+    if (req.body.published !== undefined) a.published = !!req.body.published;
+    await a.save(); res.json({ id: String(a._id), title: a.title, published: a.published });
+  } catch (e) { console.error('Standalone assignment update error:', e); res.status(500).json({ message: 'Не удалось сохранить изменения.' }); }
+});
+app.delete('/api/admin/assignments/:id', auth('admin'), async (req, res) => {
+  const a = await Assignment.findOne({ _id: req.params.id, topic: null });
+  if (!a) return res.status(404).json({ message: 'Задание не найдено.' });
+  await Submission.deleteMany({ assignment: a._id }); await a.deleteOne(); res.json({ ok: true });
+});
+
+app.get('/api/admin/assignments/:id/report', auth('admin'), async (req, res) => {
+  try {
+    const assignment = await Assignment.findOne({ _id: req.params.id, topic: null }).lean();
+    if (!assignment) return res.status(404).json({ message: 'Задание не найдено.' });
+    const students = await Student.find().sort({ schoolName: 1, grade: 1, fullName: 1 }).lean();
+    const submissions = await Submission.find({ assignment: assignment._id }).lean();
+    const rows = students.map((student, index) => {
+      const sub = submissions.find(x => String(x.student) === String(student._id));
+      return [index + 1, student.fullName, `${student.schoolName}, ${student.grade}`, sub ? `${sub.score ?? '—'}/${assignment.questions.length}` : 'Не приступал', sub ? new Date(sub.submittedAt).toLocaleString('ru-RU') : '—'];
+    });
+    const doc = new Document({ sections: [{ children: [
+      new Paragraph({ text: `Отчёт по заданию: ${assignment.title}`, heading: HeadingLevel.TITLE }),
+      new Paragraph({ text: `Вопросов: ${assignment.questions.length}. Учеников: ${students.length}.` }),
+      makeTable(['№', 'Ученик', 'Школа / класс', 'Результат', 'Дата отправки'], rows)
+    ] }] });
+    const buffer = await Packer.toBuffer(doc);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent('MODO_assignment_report.docx')}`);
+    res.send(buffer);
+  } catch (e) { console.error('Assignment report error:', e); res.status(500).json({ message: 'Не удалось сформировать отчёт.' }); }
+});
+
 app.get('/api/admin/topics', auth('admin'), async (_req, res) => {
   const topics = await Topic.find().sort({ createdAt: -1 }).lean();
   const assignments = await Assignment.find().lean();

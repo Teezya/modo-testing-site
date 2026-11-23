@@ -30,7 +30,7 @@ const topicSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const assignmentSchema = new mongoose.Schema({
-  topic: { type: mongoose.Schema.Types.ObjectId, ref: 'Topic', required: true },
+  topic: { type: mongoose.Schema.Types.ObjectId, ref: 'Topic', default: null },
   title: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
   passage: { type: String, default: '' },
@@ -44,7 +44,7 @@ const assignmentSchema = new mongoose.Schema({
 
 const submissionSchema = new mongoose.Schema({
   assignment: { type: mongoose.Schema.Types.ObjectId, ref: 'Assignment', required: true },
-  topic: { type: mongoose.Schema.Types.ObjectId, ref: 'Topic', required: true },
+  topic: { type: mongoose.Schema.Types.ObjectId, ref: 'Topic', default: null },
   student: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
   text: { type: String, default: '' },
   fileName: { type: String, default: '' },
